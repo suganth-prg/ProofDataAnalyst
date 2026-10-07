@@ -1,0 +1,8 @@
+Product,Category,Sales,Units
+Rice,Grain,12000,100
+Wheat,Grain,15000,120
+Corn,Grain,9000,80
+Apple,Fruit,8000,200
+Banana,Fruit,6000,300
+Rice,Grain,12000,100
+Mango,Fruit,,150
