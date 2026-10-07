@@ -293,20 +293,31 @@ def find_exact_value_matches(question, df):
             if len(value_clean) < 2:
                 continue
 
-            if value_clean.lower() in q:
-
+            val_lower = value_clean.lower()
+            pattern = r"\b" + re.escape(val_lower) + r"\b"
+            m = re.search(pattern, q)
+            if m:
                 matches.append({
                     "column": column,
-                    "value": value_clean
+                    "value": value_clean,
+                    "pos": m.start(),
+                    "len": len(value_clean)
+                })
+            elif val_lower in q:
+                matches.append({
+                    "column": column,
+                    "value": value_clean,
+                    "pos": q.find(val_lower),
+                    "len": len(value_clean)
                 })
 
-    # Prefer longer matches
+    # Sort matches primarily by appearance position in question,
+    # breaking ties by longer length so specific entities take precedence
     matches.sort(
-        key=lambda x: len(x["value"]),
-        reverse=True
+        key=lambda x: (x["pos"], -x["len"])
     )
 
-    # Remove duplicates
+    # Remove duplicates while preserving position order
     unique = []
     seen = set()
 
@@ -318,7 +329,10 @@ def find_exact_value_matches(question, df):
 
         if key not in seen:
             seen.add(key)
-            unique.append(m)
+            unique.append({
+                "column": m["column"],
+                "value": m["value"]
+            })
 
     return unique
 
@@ -415,21 +429,34 @@ def column_score(column, question):
     aliases = {
         "sales": [
             "sale",
+            "sales",
             "revenue",
             "income",
             "amount",
             "money",
             "earning",
             "earnings",
-            "profit"
+            "profit",
+            "make",
+            "makes",
+            "made",
+            "sell",
+            "sells",
+            "worth",
+            "price",
+            "dollar",
+            "dollars"
         ],
         "units": [
             "unit",
+            "units",
             "sold",
             "quantity",
             "qty",
             "volume",
-            "number sold"
+            "number sold",
+            "pieces",
+            "count"
         ],
         "product": [
             "item",
@@ -470,8 +497,12 @@ def choose_metric(df, question, preferred=None):
     if not nums:
         return None
 
+    # Handle list or non-string preferred metric from LLM
+    if isinstance(preferred, list) and preferred:
+        preferred = preferred[0]
+
     # Planner's metric
-    if preferred in nums:
+    if isinstance(preferred, str) and preferred in nums:
         return preferred
 
     scores = {
@@ -492,7 +523,13 @@ def choose_metric(df, question, preferred=None):
     if len(nums) == 1:
         return nums[0]
 
-    return None
+    # Semantic priority fallback: prefer Sales/Revenue/Amount columns if present
+    for priority in ["sales", "revenue", "amount", "total", "value", "price"]:
+        for c in nums:
+            if priority in normalize_name(c):
+                return c
+
+    return nums[0]
 
 
 def choose_group_column(df, question, preferred=None):
@@ -632,10 +669,19 @@ def detect_comparison(question):
         "how much more",
         "how much less",
         "difference between",
+        "difference in",
+        "difference of",
         "compare",
+        "comparison",
         "versus",
+        "vs.",
         "vs",
-        "than"
+        "than",
+        "which is higher",
+        "which is lower",
+        "which is greater",
+        "higher between",
+        "more between",
     ]
 
     return any(
@@ -710,6 +756,21 @@ Correct plan:
 }
 
 Do NOT use row_lookup for ranking questions.
+
+For comparison questions such as:
+"What is the difference between Apple and Banana sales?"
+"How much more did Wheat make than Rice?"
+"Compare Rice and Wheat."
+
+you MUST use:
+operation = "difference"
+with:
+metric = [the numeric metric to compare]
+comparison_targets = [
+  {"column": "Product", "value": "Apple"},
+  {"column": "Product", "value": "Banana"}
+]
+filters = []
 
 Return JSON only.
 """
@@ -809,6 +870,38 @@ def choose_dataset(question, datasets, plan=None):
 
         if name.lower() in q:
             return name
+
+    # Column-based selection: match dataset columns against question and plan
+    best_col_score = 0
+    best_col_dataset = None
+
+    plan_cols = set()
+    if plan and isinstance(plan, dict):
+        if plan.get("metric"):
+            m = plan["metric"]
+            if isinstance(m, list):
+                plan_cols.update(m)
+            elif isinstance(m, str):
+                plan_cols.add(m)
+        if plan.get("group_by"):
+            for g in plan["group_by"]:
+                if isinstance(g, str):
+                    plan_cols.add(g)
+
+    for name, df in datasets.items():
+        score = 0
+        for col in df.columns:
+            col_l = col.lower()
+            if col in plan_cols or col_l in q:
+                score += 4
+            elif column_score(col, question) > 0:
+                score += 2
+        if score > best_col_score:
+            best_col_score = score
+            best_col_dataset = name
+
+    if best_col_dataset and best_col_score > 0:
+        return best_col_dataset
 
     return None
 
@@ -927,12 +1020,16 @@ def normalize_plan(plan, df):
 
     metric = plan.get("metric")
 
-    if metric not in df.columns:
+    if isinstance(metric, list):
+        metric = next((m for m in metric if isinstance(m, str) and m in df.columns), None)
+    elif not isinstance(metric, str) or metric not in df.columns:
         metric = None
 
     secondary = plan.get("secondary_metric")
 
-    if secondary not in df.columns:
+    if isinstance(secondary, list):
+        secondary = next((s for s in secondary if isinstance(s, str) and s in df.columns), None)
+    elif not isinstance(secondary, str) or secondary not in df.columns:
         secondary = None
 
     group_by = plan.get("group_by", [])
@@ -1123,11 +1220,13 @@ def repair_plan(question, df, plan):
     )
 
     # Only apply matches for non-ranking analytical questions.
-    # This prevents ranking questions from accidentally becoming
-    # "Rice only" questions.
+    # This prevents ranking or comparison questions from accidentally becoming single-item filters.
+    is_comparison = detect_comparison(question) or p.get("operation") == "difference"
+
     if (
         matches
         and not detect_ranking_intent(question)
+        and not is_comparison
     ):
 
         # Avoid adding unrelated values from numeric columns.
@@ -1170,7 +1269,7 @@ def repair_plan(question, df, plan):
     # Difference/comparison
     # ------------------------------------------------------------
 
-    if detect_comparison(question):
+    if is_comparison:
 
         p["operation"] = "difference"
 
@@ -1188,17 +1287,26 @@ def repair_plan(question, df, plan):
             []
         )
 
+        # If LLM put comparison items into filters, extract them
+        if len(targets) < 2 and p.get("filters"):
+            extracted = []
+            for f in p["filters"]:
+                col = f.get("column")
+                val = f.get("value")
+                if col in df.columns and val is not None:
+                    if isinstance(val, list):
+                        for sub_v in val:
+                            extracted.append({"column": col, "value": str(sub_v)})
+                    else:
+                        extracted.append({"column": col, "value": str(val)})
+            if len(extracted) >= 2:
+                targets = extracted[:2]
+
         # If planner did not find two targets,
         # derive them from actual data values.
         if len(targets) < 2:
 
-            matches = find_exact_value_matches(
-                question,
-                df
-            )
-
             if len(matches) >= 2:
-
                 targets = [
                     {
                         "column": matches[0]["column"],
@@ -1210,7 +1318,27 @@ def repair_plan(question, df, plan):
                     }
                 ]
 
+        # Order targets according to their appearance in the user question
+        if len(targets) >= 2:
+            q_lower = question.lower()
+            def target_pos(t):
+                val = str(t.get("value", "")).lower()
+                pattern = r"\b" + re.escape(val) + r"\b"
+                m = re.search(pattern, q_lower)
+                if m:
+                    return m.start()
+                pos = q_lower.find(val)
+                return pos if pos != -1 else 999999
+            targets = sorted(targets[:2], key=target_pos)
+
         p["comparison_targets"] = targets
+
+        # CRITICAL FIX: Ensure comparison target columns are NOT filtered out
+        target_cols = {t["column"] for t in targets}
+        p["filters"] = [
+            f for f in p.get("filters", [])
+            if f.get("column") not in target_cols
+        ]
 
         return p
 
@@ -1880,9 +2008,44 @@ def format_answer(question, plan, result):
 
     if operation == "difference":
 
+        targets = plan.get("comparison_targets", [])
+        metric = plan.get("metric", "value")
+        v1 = result.get("first", 0)
+        v2 = result.get("second", 0)
+        diff = result.get("difference", 0)
+        abs_diff = abs(diff)
+
+        def fmt(n):
+            if isinstance(n, (int, float)):
+                if n == int(n):
+                    return f"{int(n):,}"
+                return f"{n:,.2f}"
+            return str(n)
+
+        if len(targets) >= 2:
+            t1 = targets[0].get("value")
+            t2 = targets[1].get("value")
+            q_lower = question.lower()
+            if "how much more" in q_lower or "more" in q_lower or "higher" in q_lower or "greater" in q_lower:
+                if diff > 0:
+                    return f"{t1} has {fmt(abs_diff)} more {metric} than {t2} ({t1}: {fmt(v1)}, {t2}: {fmt(v2)})."
+                elif diff < 0:
+                    return f"{t1} has {fmt(abs_diff)} less {metric} than {t2} ({t1}: {fmt(v1)}, {t2}: {fmt(v2)})."
+                else:
+                    return f"{t1} and {t2} have equal {metric} ({fmt(v1)})."
+            elif "how much less" in q_lower or "less" in q_lower or "lower" in q_lower:
+                if diff < 0:
+                    return f"{t1} has {fmt(abs_diff)} less {metric} than {t2} ({t1}: {fmt(v1)}, {t2}: {fmt(v2)})."
+                elif diff > 0:
+                    return f"{t1} has {fmt(abs_diff)} more {metric} than {t2} ({t1}: {fmt(v1)}, {t2}: {fmt(v2)})."
+                else:
+                    return f"{t1} and {t2} have equal {metric} ({fmt(v1)})."
+            else:
+                return f"{t1} has {fmt(v1)} {metric} and {t2} has {fmt(v2)} {metric}. The difference is {fmt(abs_diff)}."
+
         return (
             f"The difference is "
-            f"{result['difference']}."
+            f"{fmt(result['difference'])}."
         )
 
     if operation == "aggregate":
@@ -1959,48 +2122,31 @@ def print_json(title, value):
 # MAIN QUESTION PIPELINE
 # ================================================================
 
-def answer_question(question, datasets):
+# ================================================================
+# MAIN QUESTION PIPELINE
+# ================================================================
 
-    print()
-    print("=" * 70)
-    print("QUESTION")
-    print("=" * 70)
-    print(question)
+def analyze_query(question, datasets=None):
+    """Programmatic entry point for CLI and Web UI."""
+    if datasets is None:
+        datasets = load_datasets()
 
     if not datasets:
-        print(
-            "\nRESULT: REFUSED\n"
-            "No CSV datasets were found in data/."
-        )
-        return
+        return {
+            "status": "REFUSED",
+            "success": False,
+            "question": question,
+            "error": "No CSV datasets were found in data/."
+        }
 
-    # ------------------------------------------------------------
-    # Ask planner
-    # ------------------------------------------------------------
-
+    raw_plan = {}
     try:
         raw_plan = llm_plan(
             question,
             datasets
         )
-
-    except Exception as exc:
-
-        print(
-            "\nRESULT: REFUSED\n"
-            f"LLM planning failed: {exc}"
-        )
-
-        return
-
-    print_json(
-        "RAW PLAN:",
-        raw_plan
-    )
-
-    # ------------------------------------------------------------
-    # Choose dataset
-    # ------------------------------------------------------------
+    except Exception:
+        raw_plan = {}
 
     dataset_name = choose_dataset(
         question,
@@ -2009,151 +2155,88 @@ def answer_question(question, datasets):
     )
 
     if not dataset_name:
+        return {
+            "status": "REFUSED",
+            "success": False,
+            "question": question,
+            "raw_plan": raw_plan,
+            "error": "Could not determine which dataset contains the answer."
+        }
 
-        print(
-            "\nRESULT: REFUSED\n"
-            "Could not determine which dataset "
-            "contains the answer."
-        )
-
-        return
-
-    df = datasets[
-        dataset_name
-    ]
-
-    # ------------------------------------------------------------
-    # Repair plan using actual data
-    # ------------------------------------------------------------
-
-    plan = repair_plan(
-        question,
-        df,
-        raw_plan
-    )
-
-    plan["dataset"] = dataset_name
-
-    print_json(
-        "VALIDATED PLAN:",
-        plan
-    )
-
-    # ------------------------------------------------------------
-    # Refuse genuinely incomplete plans
-    # ------------------------------------------------------------
-
-    if plan["operation"] == "top_n":
-
-        if not plan["metric"]:
-            print(
-                "\nRESULT: REFUSED\n"
-                "Could not determine the metric "
-                "to rank by."
-            )
-            return
-
-        if not plan["group_by"]:
-            print(
-                "\nRESULT: REFUSED\n"
-                "Could not determine what entity "
-                "should be ranked."
-            )
-            return
-
-    # ------------------------------------------------------------
-    # Execute
-    # ------------------------------------------------------------
+    df = datasets[dataset_name]
 
     try:
+        plan = repair_plan(
+            question,
+            df,
+            raw_plan
+        )
+        plan["dataset"] = dataset_name
+    except Exception as exc:
+        return {
+            "status": "REFUSED",
+            "success": False,
+            "question": question,
+            "dataset_name": dataset_name,
+            "raw_plan": raw_plan,
+            "error": f"Plan validation failed: {exc}"
+        }
 
+    if plan["operation"] == "top_n":
+        if not plan["metric"]:
+            return {
+                "status": "REFUSED",
+                "success": False,
+                "question": question,
+                "dataset_name": dataset_name,
+                "raw_plan": raw_plan,
+                "plan": plan,
+                "error": "Could not determine the metric to rank by."
+            }
+
+        if not plan["group_by"]:
+            return {
+                "status": "REFUSED",
+                "success": False,
+                "question": question,
+                "dataset_name": dataset_name,
+                "raw_plan": raw_plan,
+                "plan": plan,
+                "error": "Could not determine what entity should be ranked."
+            }
+
+    try:
         result = execute_plan(
             df,
             plan
         )
-
     except Exception as exc:
-
-        print(
-            "\nRESULT: REFUSED\n"
-            f"Execution failed: {exc}"
-        )
-
-        return
-
-    # ------------------------------------------------------------
-    # Show deterministic calculation
-    # ------------------------------------------------------------
-
-    print()
-    print("GENERATED CALCULATION:")
-    print("-" * 70)
-
-    if plan["operation"] == "top_n":
-
-        print(
-            f"GROUP BY {plan['group_by']} "
-            f"→ SUM({plan['metric']}) "
-            f"→ SORT {plan['direction']} "
-            f"→ TOP {plan['limit']}"
-        )
-
-    elif plan["operation"] == "difference":
-
-        print(
-            f"Compare {plan['metric']} "
-            f"for two requested entities."
-        )
-
-    elif plan["operation"] == "aggregate":
-
-        print(
-            f"{plan.get('calculation') or 'SUM'}"
-            f"({plan['metric']})"
-        )
-
-    else:
-
-        print(
-            f"Operation: {plan['operation']}"
-        )
-
-    print_json(
-        "GENERATED RESULT:",
-        result
-    )
-
-    # ------------------------------------------------------------
-    # Independent verification
-    # ------------------------------------------------------------
+        return {
+            "status": "REFUSED",
+            "success": False,
+            "question": question,
+            "dataset_name": dataset_name,
+            "raw_plan": raw_plan,
+            "plan": plan,
+            "error": f"Execution failed: {exc}"
+        }
 
     try:
-
-        independent_result = (
-            independent_verify(
-                df,
-                plan
-            )
+        independent_result = independent_verify(
+            df,
+            plan
         )
-
     except Exception as exc:
-
-        print(
-            "\nRESULT: REFUSED\n"
-            f"Independent verification failed: "
-            f"{exc}"
-        )
-
-        return
-
-    print_json(
-        "INDEPENDENT RESULT:",
-        independent_result
-    )
-
-    # ------------------------------------------------------------
-    # Verify
-    # ------------------------------------------------------------
+        return {
+            "status": "REFUSED",
+            "success": False,
+            "question": question,
+            "dataset_name": dataset_name,
+            "raw_plan": raw_plan,
+            "plan": plan,
+            "result": result,
+            "error": f"Independent verification failed: {exc}"
+        }
 
     verified = results_match(
         result,
@@ -2161,34 +2244,94 @@ def answer_question(question, datasets):
     )
 
     if not verified:
-
-        print()
-        print(
-            "VERIFICATION: FAILED"
-        )
-
-        print(
-            "\nRESULT: REFUSED\n"
-            "The independent calculation "
-            "does not agree with the generated result."
-        )
-
-        return
-
-    print()
-    print(
-        "VERIFICATION: PASSED"
-    )
-
-    # ------------------------------------------------------------
-    # Final answer
-    # ------------------------------------------------------------
+        return {
+            "status": "REFUSED",
+            "success": False,
+            "question": question,
+            "dataset_name": dataset_name,
+            "raw_plan": raw_plan,
+            "plan": plan,
+            "result": result,
+            "independent_result": independent_result,
+            "verified": False,
+            "error": "The independent calculation does not agree with the generated result."
+        }
 
     answer = format_answer(
         question,
         plan,
         result
     )
+
+    calc_summary = ""
+    if plan["operation"] == "top_n":
+        calc_summary = f"GROUP BY {plan['group_by']} -> SUM({plan['metric']}) -> SORT {plan['direction']} -> TOP {plan['limit']}"
+    elif plan["operation"] == "difference":
+        targets = plan.get("comparison_targets", [])
+        t_desc = f"{targets[0].get('value')} vs {targets[1].get('value')}" if len(targets) >= 2 else "two entities"
+        calc_summary = f"Compare {plan.get('metric')} for {t_desc}: SUM({plan.get('metric')}) per entity -> DIFFERENCE"
+    elif plan["operation"] == "aggregate":
+        calc_summary = f"{plan.get('calculation') or 'SUM'}({plan['metric']})"
+    else:
+        calc_summary = f"Operation: {plan['operation']}"
+
+    return {
+        "status": "VERIFIED",
+        "success": True,
+        "question": question,
+        "dataset_name": dataset_name,
+        "raw_plan": raw_plan,
+        "plan": plan,
+        "calculation_summary": calc_summary,
+        "result": result,
+        "independent_result": independent_result,
+        "verified": True,
+        "answer": answer,
+        "proof": "Deterministic execution and independent verification agree.",
+        "error": None
+    }
+
+
+def answer_question(question, datasets):
+    print()
+    print("=" * 70)
+    print("QUESTION")
+    print("=" * 70)
+    print(question)
+
+    data = analyze_query(question, datasets)
+
+    if not data["success"]:
+        if data.get("raw_plan"):
+            print_json("RAW PLAN:", data["raw_plan"])
+        if data.get("plan"):
+            print_json("VALIDATED PLAN:", data["plan"])
+        if data.get("result"):
+            print_json("GENERATED RESULT:", data["result"])
+        if data.get("independent_result"):
+            print_json("INDEPENDENT RESULT:", data["independent_result"])
+        if data.get("verified") is False:
+            print()
+            print("VERIFICATION: FAILED")
+        print(
+            "\nRESULT: REFUSED\n"
+            f"{data.get('error', 'Execution refused.')}"
+        )
+        return data
+
+    print_json("RAW PLAN:", data["raw_plan"])
+    print_json("VALIDATED PLAN:", data["plan"])
+
+    print()
+    print("GENERATED CALCULATION:")
+    print("-" * 70)
+    print(data["calculation_summary"])
+
+    print_json("GENERATED RESULT:", data["result"])
+    print_json("INDEPENDENT RESULT:", data["independent_result"])
+
+    print()
+    print("VERIFICATION: PASSED")
 
     print()
     print("=" * 70)
@@ -2197,15 +2340,16 @@ def answer_question(question, datasets):
 
     print()
     print("ANSWER:")
-    print(answer)
+    print(data["answer"])
 
     print()
     print(
         "Proof: deterministic execution and "
         "independent verification agree."
     )
-
     print("=" * 70)
+
+    return data
 
 
 # ================================================================
